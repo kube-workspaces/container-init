@@ -1,0 +1,22 @@
+#cloud-config
+# Requires shadow-compatible account tools and tzdata already in the image.
+# Run with --default-user developer --run-as developer -- <application argv>.
+groups:
+  - developers
+users:
+  - name: developer
+    uid: 1000
+    primary_group: developers
+    homedir: /home/developer
+    shell: /bin/sh
+    lock_passwd: true
+timezone: Etc/UTC
+write_files:
+  - path: /home/developer/welcome.txt
+    content: |
+      Provisioned as root before the application drops to developer.
+    owner: developer:developers
+    permissions: '0644'
+    defer: true
+runcmd:
+  - [test, -s, /home/developer/welcome.txt]

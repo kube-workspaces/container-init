@@ -4,10 +4,10 @@ A Go executable for initializing Linux containers from an explicit subset of
 cloud-init `#cloud-config`, before launching their application. Intended for
 both kube-workspaces `container` and `scratch` workspaces, and usable standalone.
 
-**Status:** initial executable foundation. Six of the selected twelve top-level
-keys are implemented. Opt-in platform integration requires matching Image/
-Workspace CRDs, API and controller. Account/SSH/CA/timezone adapters, privilege
-dropping and persistent execution state are pending. Compatibility is
+**Status:** all twelve selected top-level keys have an explicit supported subset.
+Opt-in platform integration requires matching Image/Workspace CRDs, API and
+controller. Application privilege dropping and optional diagnostic state are
+implemented. Compatibility is
 with the documented subset, not every cloud-init module or nested option.
 
 ## Build and run
@@ -49,12 +49,12 @@ reviewed on 2026-10-26. Twelve configuration keys cover nine upstream modules.
 |---|---|
 | `bootcmd` | Early shell strings or nonempty argv lists. |
 | `write_files` | Inline text, `!!binary`, base64 and gzip content; owner/group; octal permissions; append; deferred writes; create absent parent directories. |
-| `groups` | Planned; rejected before provisioning. |
-| `users` | Planned; rejected before provisioning. |
-| `chpasswd` | Planned; rejected before provisioning. |
-| `ssh_authorized_keys` | Planned; rejected before provisioning. |
-| `ca_certs` | Planned; rejected before provisioning. |
-| `timezone` | Planned; rejected before provisioning. |
+| `groups` | Named groups and single-name membership mappings; membership users must already exist. |
+| `users` | Named users, UID, home/shell, primary/supplementary groups, system/no-create-home, password lock and per-user SSH keys. |
+| `chpasswd` | Modern `users` list, explicit `text` or modular crypt `hash` (default); `expire` defaults true. Passwords use stdin with tool output suppressed. |
+| `ssh_authorized_keys` | Single-line OpenSSH public keys for the explicit `--default-user`; additive/deduplicated, owned 0700/0600 SSH files. |
+| `ca_certs` | One PEM certificate per `trusted` entry, content-addressed files and `update-ca-certificates`; default trust is retained. |
+| `timezone` | Installed IANA zoneinfo copied to `/etc/localtime`, name written to `/etc/timezone`. |
 | `package_update` | Boolean cache refresh with APT/APK. |
 | `package_upgrade` | Boolean upgrade with APT/APK, after cache refresh. |
 | `packages` | Names and `[name, version]` pairs with APT/APK; cache refresh is automatic for installation. |
@@ -64,7 +64,7 @@ reviewed on 2026-10-26. Twelve configuration keys cover nine upstream modules.
 
 - One YAML document, beginning with `#cloud-config`, with a mapping at its root.
   Unknown keys/options, duplicate mapping keys, YAML aliases/anchors/merges,
-  pending keys and invalid types fail before provisioning. Errors omit scalar
+   unsupported options and invalid types fail before provisioning. Errors omit scalar
   payloads. Input is bounded to 4 MiB and each decoded file to 16 MiB.
 - Commands are ordered as supplied. Shell strings use `/bin/sh -c`; argv arrays
   do not interpret shell variables or quoting. Arguments must be YAML strings
@@ -92,11 +92,12 @@ reviewed on 2026-10-26. Twelve configuration keys cover nine upstream modules.
 ## Execution contract
 
 Order: full document validation and available-host preflight → `bootcmd` → early
-`write_files` → package cache refresh → optional upgrade → installs → deferred
+`write_files` → groups → users → passwords → explicit password locks → default-user SSH keys → CA trust →
+timezone → package cache refresh → optional upgrade → installs → deferred
 `write_files` → `runcmd` → optional application exec.
 
 Every invocation runs all requested steps. There are no once-per-instance
-markers or resumable phases yet. Avoid assuming that arbitrary commands are
+skip markers or resumable phases. Avoid assuming that arbitrary commands are
 idempotent or have exactly-once effects. A PVC marker surviving replacement does
 not mean the replacement container retains packages installed in the old root
 filesystem. Upstream cloud-init normally runs many modules once per instance;
@@ -113,9 +114,81 @@ Background daemons launched during provisioning are not supervised.
 Phase logs contain step labels, not configuration content or command arguments.
 Command stdout/stderr are streamed to the container's stdout/stderr: user
 commands and external tools can themselves print sensitive data. Execution
-uses the invoking identity and is not sandboxed. Privilege dropping is pending;
-if initialization runs as root, the application also runs as root unless its
-explicit entrypoint drops privileges itself.
+uses the invoking identity and is not sandboxed. By default the application
+keeps that identity. `--run-as ACCOUNT` instead resolves a non-root account after
+setup, replaces supplementary groups/GID/UID, sets HOME/USER/LOGNAME, enables
+Linux no-new-privileges, and then execs the application. Root is required to drop
+privileges. Working directory and application argv are preserved. Account creation
+may happen during this invocation; failed identity resolution prevents handoff.
+Inherited caller groups are deliberately replaced. If application access to a
+shared volume relies on a Kubernetes fsGroup, make the target account a member
+of that group in the image/configuration; Pod security-context fields themselves
+are preserved by injection.
+
+### Accounts, SSH, trust and timezone prerequisites
+
+These modules require root and writable target filesystems. Account operations
+use shadow-compatible `groupadd`, `useradd`, `usermod`, `chpasswd` and (when
+expiring passwords) `chage`. Debian/Ubuntu images commonly include these through
+`passwd`; Alpine images must bake in `shadow`. These tools must exist **before**
+provisioning, because account phases precede package installation. Likewise bake
+in `ca-certificates` / `update-ca-certificates` and `tzdata` before requesting CA
+or timezone setup. Missing prerequisites fail preflight before boot commands run.
+
+`users` entries are names or mappings with `name`, positive `uid`, absolute
+`homedir`/`shell`, `primary_group`, `groups` (list/comma-separated string),
+`system`, `no_create_home`, `lock_passwd` and `ssh_authorized_keys`. Names follow
+`[a-z_][a-z0-9_-]{0,31}`. New users get a home/private group unless explicitly
+configured otherwise and start with a locked password. Existing users are not
+silently relocated or renumbered: conflicting UID/home/shell/primary-group
+requests fail. Supplementary groups are added without removing existing ones.
+Explicit lock settings are applied after password changes, so `lock_passwd: true`
+remains locked even when a password is supplied. Unlock requires a usable existing
+hash or a `chpasswd.users` password; passwordless account unlock is rejected.
+The string `default`
+requires `--default-user` naming an existing account; no distro admin user is
+guessed. Top-level SSH keys use the same explicit account and may refer to a user
+created earlier in the document. Per-user keys need no default-account flag.
+
+SSH keys accept unadorned OpenSSH RSA/Ed25519/ECDSA/security-key public-key lines;
+authorized_keys options, multiline content and private keys are rejected. Existing
+authorized_keys content is preserved and matching key type/blob pairs are not
+added again. Symlinked SSH directories/key files are rejected. This does not
+install/start SSH, import cloud metadata keys or generate host keys.
+
+`chpasswd` accepts only modern `users: [{name, password, type: text|hash}]` plus
+`expire`. Text passwords must be explicitly labelled `type: text`; hash is the
+default and requires a modular crypt format supported by the image's tools.
+Blank passwords, random generation, deprecated `list`, and passwords embedded in
+`users` mappings are rejected. External password-tool stdout/stderr are suppressed;
+passwords are never placed in argv, environment, diagnostic state or phase logs.
+Ordinary user commands can still print their own secrets.
+
+CA setup is additive: each `trusted` entry must be one valid PEM certificate.
+It writes deterministic files under `/usr/local/share/ca-certificates` and
+refreshes the image trust store. `remove_defaults: true` and the deprecated
+`ca-certs` alias are rejected. Existing trust and previously installed local
+certificates remain. Timezone setup uses existing `/usr/share/zoneinfo`; it does
+not install tzdata, invoke systemd, change the host clock or configure NTP.
+
+### Diagnostic invocation state
+
+`--status-file /run/provision/status.json` atomically writes a mode-0600 JSON
+record containing schema version, raw-document SHA-256, running/succeeded/failed
+state, current step and UTC timestamps. It stores no scripts, passwords or error
+payloads. The parent must be writable; new parent directories use 0700. A write
+failure prevents further provisioning. State records provisioning only, not the
+application's subsequent health, and are **never used to skip work**. Pointing
+this at a PVC does not make root setup persistent or arbitrary commands exactly
+once. Changed documents get a new hash; partial failures retry from the beginning.
+
+`--termination-message /dev/termination-log` additionally emits a small,
+payload-free failure record for Kubernetes (source/version/state/step only).
+The controller uses it to expose a `ContainerInitialized=False` condition with
+reason `ContainerInitFailed`; arbitrary tool output is not copied into that
+condition. Preflight and handoff errors are labelled separately. A running retry
+does not retain a previous attempt's failure condition. Pod Ready alone does not
+prove provisioning completion; verify application-specific readiness or markers.
 
 ## Baked-in and injected usage
 
@@ -166,9 +239,10 @@ pushing. Publishing is gated on native builds/tests and lint and consumes the
 verified per-target binary artifacts. The tag release waits for image publication
 as well as archive packaging.
 
-Configure a published immutable reference through Helm's
-`controller.containerInitImage` or the controller's `KW_CONTAINER_INIT_IMAGE` /
-`--container-init-image` setting. Empty disables injected mode. The controller
+Helm defaults `controller.containerInitImage` to the published `:latest` image.
+Override it to pin an immutable reference, or use the controller's
+`KW_CONTAINER_INIT_IMAGE` / `--container-init-image` setting. An explicit empty
+value disables injected mode. The controller
 uses the image's `/usr/local/bin/container-init` and `/bin/sh` to copy the runner
 into its shared writable installer mount; the main container mounts it read-only.
 Image pull access/visibility must be configured like other workspace images.
@@ -188,7 +262,10 @@ Unit tests run commands and file writes only in temporary test locations;
 package adapter tests use a fake runner and never install packages on the host.
 Opt-in integration tests cover real APT/APK installation in disposable Debian
 and Alpine containers, file visibility, explicit argv/exit-status handoff and
-rejection of pending configuration before any commands execute.
+rejection of unsupported configuration before any commands execute. Extended
+cases bake in account/trust/timezone prerequisites, create and reconfigure real
+accounts, verify SSH ownership/deduplication and actual OpenSSL trust, and repeat
+setup before a non-root/no-new-privileges application handoff.
 
 `make lint` uses golangci-lint v2.13.2, matching CI. `make check` also runs the
 Python release-helper tests. Workflows are checked in CI with actionlint v1.7.12.

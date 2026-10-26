@@ -58,7 +58,7 @@ func TestRejectUnsupportedAndMalformedBeforeExecution(t *testing.T) {
 		"multiple docs":     "#cloud-config\nruncmd: []\n---\nruncmd: []\n",
 		"duplicate":         "#cloud-config\nruncmd: []\nruncmd: []\n",
 		"unknown":           "#cloud-config\ndisk_setup: {}\n",
-		"pending":           "#cloud-config\nchpasswd: {users: [{name: root, password: do-not-print-me}]}\n",
+		"password type":     "#cloud-config\nchpasswd: {users: [{name: root, password: do-not-print-me, type: random}]}\n",
 		"alias":             "#cloud-config\nbootcmd: &cmd [echo]\nruncmd: *cmd\n",
 		"merge":             "#cloud-config\n<<: {runcmd: []}\n",
 		"invalid bool":      "#cloud-config\npackage_update: 'true'\n",
@@ -99,20 +99,14 @@ func TestRejectUnsupportedAndMalformedBeforeExecution(t *testing.T) {
 	}
 }
 
-func TestAllPendingKeysRejectEvenEmptyValues(t *testing.T) {
+func TestSelectedTwelveKeysAreImplemented(t *testing.T) {
 	if got := len(Keys()); got != 12 {
 		t.Fatalf("expected selected 12-key scope, got %d", got)
 	}
 	for _, key := range Keys() {
-		if key.Implemented {
-			continue
+		if !key.Implemented {
+			t.Fatalf("selected key remains unimplemented: %s", key.Name)
 		}
-		t.Run(key.Name, func(t *testing.T) {
-			_, err := Parse(strings.NewReader("#cloud-config\n" + key.Name + ": null\n"))
-			if err == nil || !strings.Contains(err.Error(), "planned but not implemented") {
-				t.Fatalf("expected explicit pending-key error, got %v", err)
-			}
-		})
 	}
 }
 

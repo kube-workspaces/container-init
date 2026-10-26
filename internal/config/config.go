@@ -31,20 +31,27 @@ type Key struct {
 // Keys returns a fresh list so callers cannot change the parser's capabilities.
 func Keys() []Key {
 	return []Key{
-		{"bootcmd", true}, {"write_files", true}, {"groups", false},
-		{"users", false}, {"chpasswd", false}, {"ssh_authorized_keys", false},
-		{"ca_certs", false}, {"timezone", false}, {"package_update", true},
+		{"bootcmd", true}, {"write_files", true}, {"groups", true},
+		{"users", true}, {"chpasswd", true}, {"ssh_authorized_keys", true},
+		{"ca_certs", true}, {"timezone", true}, {"package_update", true},
 		{"package_upgrade", true}, {"packages", true}, {"runcmd", true},
 	}
 }
 
 type Config struct {
-	BootCmd        []Command
-	WriteFiles     []File
-	PackageUpdate  bool
-	PackageUpgrade bool
-	Packages       []Package
-	RunCmd         []Command
+	BootCmd         []Command
+	WriteFiles      []File
+	PackageUpdate   bool
+	PackageUpgrade  bool
+	Packages        []Package
+	RunCmd          []Command
+	Groups          []Group
+	Users           []User
+	Passwords       []Password
+	ExpirePasswords bool
+	SSHKeys         []string
+	CACerts         []string
+	Timezone        string
 }
 
 type Command struct {
@@ -186,6 +193,9 @@ func Parse(r io.Reader) (*Config, error) {
 			}
 			c.Packages = append(c.Packages, p)
 		}
+	}
+	if err := accountConfig(c, fields); err != nil {
+		return nil, err
 	}
 	return c, nil
 }

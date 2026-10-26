@@ -2,7 +2,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -42,12 +45,31 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, handoff func([]string) error) error {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, handoff func([]string) error) (runErr error) {
 	flags := flag.NewFlagSet("container-init", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	var path string
+	var path, defaultUser, runAs, statusFile, terminationMessage string
 	var validate, dryRun, showVersion, showKeys bool
+	phase := "preflight"
+	defer func() {
+		if runErr != nil && terminationMessage != "" && !validate && !dryRun {
+			data, _ := json.Marshal(struct {
+				Source  string `json:"source"`
+				Version int    `json:"version"`
+				State   string `json:"state"`
+				Step    string `json:"step"`
+			}{"container-init", 1, "failed", phase})
+			// Kubernetes mounts this file separately, so atomic rename is not possible.
+			if err := os.WriteFile(terminationMessage, data, 0600); err != nil {
+				fmt.Fprintln(stderr, "container-init: could not write termination diagnostic")
+			}
+		}
+	}()
 	flags.StringVar(&path, "user-data", "", "cloud-config file path, or - for stdin (required)")
+	flags.StringVar(&defaultUser, "default-user", "", "explicit account for users: default and top-level SSH keys")
+	flags.StringVar(&runAs, "run-as", "", "drop to this non-root account after provisioning and before application exec")
+	flags.StringVar(&statusFile, "status-file", "", "write atomic diagnostic JSON; never skips provisioning")
+	flags.StringVar(&terminationMessage, "termination-message", "", "write payload-free failure JSON to this Kubernetes termination-message file")
 	flags.BoolVar(&validate, "validate", false, "validate supported configuration without host checks or mutations")
 	flags.BoolVar(&dryRun, "dry-run", false, "validate and preflight, then list steps without executing them")
 	flags.BoolVar(&showVersion, "version", false, "print version")
@@ -85,6 +107,12 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if (validate || dryRun) && len(flags.Args()) > 0 {
 		return errors.New("validation/dry-run cannot launch an application")
 	}
+	if defaultUser != "" && !config.ValidAccountName(defaultUser) {
+		return errors.New("invalid --default-user")
+	}
+	if runAs != "" && (runAs == "root" || !config.ValidAccountName(runAs) || (!validate && !dryRun && len(flags.Args()) == 0)) {
+		return errors.New("--run-as requires a non-root account name and application argv")
+	}
 	input := stdin
 	if path != "-" {
 		file, err := os.Open(path)
@@ -94,7 +122,11 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		defer func() { _ = file.Close() }()
 		input = file
 	}
-	c, err := config.Parse(input)
+	data, err := io.ReadAll(io.LimitReader(input, config.MaxDocumentBytes+1))
+	if err != nil {
+		return errors.New("cannot read user-data")
+	}
+	c, err := config.Parse(bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -102,9 +134,29 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		fmt.Fprintln(stdout, "cloud-config is valid for the implemented subset")
 		return nil
 	}
+	if runAs != "" && os.Geteuid() != 0 {
+		return errors.New("--run-as requires root to replace application credentials")
+	}
+	var status func(string, string) error
+	if statusFile != "" && !dryRun {
+		status = provision.StatusWriter(statusFile, fmt.Sprintf("%x", sha256.Sum256(data)))
+	}
 	plan, err := provision.Build(c, provision.Options{
-		Commands: provision.ProcessRunner{Stdout: stdout, Stderr: stderr},
-		Log:      stderr,
+		Commands:    provision.ProcessRunner{Stdout: stdout, Stderr: stderr},
+		Log:         stderr,
+		DefaultUser: defaultUser,
+		Status: func(state, step string) error {
+			if state == "running" && step != "" {
+				phase = step
+			}
+			if state == "succeeded" {
+				phase = "handoff"
+			}
+			if status != nil {
+				return status(state, step)
+			}
+			return nil
+		},
 	})
 	if err != nil {
 		return err
@@ -119,6 +171,11 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return err
 	}
 	if len(flags.Args()) > 0 {
+		if runAs != "" {
+			if err := provision.DropPrivileges(runAs); err != nil {
+				return err
+			}
+		}
 		return handoff(flags.Args())
 	}
 	return nil

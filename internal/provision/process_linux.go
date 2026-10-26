@@ -20,11 +20,24 @@ type ProcessRunner struct {
 // Run never invokes a shell implicitly. Each provisioning command gets a process
 // group so cancellation also terminates descendants, not just the direct child.
 func (r ProcessRunner) Run(ctx context.Context, args, extraEnv []string) error {
+	return r.run(ctx, args, extraEnv, nil, false)
+}
+
+// RunInput keeps passwords out of argv, environment and external-tool output.
+func (r ProcessRunner) RunInput(ctx context.Context, args []string, input io.Reader) error {
+	return r.run(ctx, args, nil, input, true)
+}
+
+func (r ProcessRunner) run(ctx context.Context, args, extraEnv []string, input io.Reader, sensitive bool) error {
 	if len(args) == 0 || args[0] == "" {
 		return errors.New("missing executable")
 	}
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Stdout, cmd.Stderr = r.Stdout, r.Stderr
+	cmd.Stdin = input
+	if sensitive {
+		cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+	}
 	cmd.Env = mergeEnv(os.Environ(), extraEnv)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {

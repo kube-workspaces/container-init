@@ -20,11 +20,13 @@ type Commander interface {
 }
 
 type Options struct {
-	Commands Commander
-	LookPath func(string) (string, error)
-	DistroID func() (string, error)
-	EUID     func() int
-	Log      io.Writer
+	Commands    Commander
+	LookPath    func(string) (string, error)
+	DistroID    func() (string, error)
+	EUID        func() int
+	Log         io.Writer
+	DefaultUser string
+	Status      func(string, string) error
 }
 
 type Step struct {
@@ -33,8 +35,9 @@ type Step struct {
 }
 
 type Plan struct {
-	steps []Step
-	log   io.Writer
+	steps  []Step
+	log    io.Writer
+	status func(string, string) error
 }
 
 func (p *Plan) Names() []string {
@@ -67,7 +70,7 @@ func Build(c *config.Config, opts Options) (*Plan, error) {
 	if opts.Log == nil {
 		opts.Log = io.Discard
 	}
-	p := &Plan{log: opts.Log}
+	p := &Plan{log: opts.Log, status: opts.Status}
 	for _, commands := range [][]config.Command{c.BootCmd, c.RunCmd} {
 		for _, command := range commands {
 			if command.Shell {
@@ -119,6 +122,11 @@ func Build(c *config.Config, opts Options) (*Plan, error) {
 	if err := addFiles(false); err != nil {
 		return nil, err
 	}
+	accountSteps, err := identitySteps(c, opts)
+	if err != nil {
+		return nil, err
+	}
+	p.steps = append(p.steps, accountSteps...)
 	if c.PackageUpdate || c.PackageUpgrade || len(c.Packages) > 0 {
 		if opts.EUID() != 0 {
 			return nil, errors.New("package provisioning requires root")
@@ -148,17 +156,35 @@ func Build(c *config.Config, opts Options) (*Plan, error) {
 }
 
 func (p *Plan) Run(ctx context.Context) error {
+	update := func(state, step string) error {
+		if p.status != nil {
+			return p.status(state, step)
+		}
+		return nil
+	}
+	if err := update("running", ""); err != nil {
+		return err
+	}
 	for _, step := range p.steps {
 		if err := ctx.Err(); err != nil {
+			_ = update("failed", step.Name)
+			return err
+		}
+		if err := update("running", step.Name); err != nil {
 			return err
 		}
 		// Only phase labels are logged, not scripts, args, file content or passwords.
 		fmt.Fprintf(p.log, "container-init: %s\n", step.Name)
 		if err := step.run(ctx); err != nil {
+			_ = update("failed", step.Name)
 			return fmt.Errorf("%s: %w", step.Name, err)
 		}
 	}
-	return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		_ = update("failed", "")
+		return err
+	}
+	return update("succeeded", "")
 }
 
 type packageStep struct {
