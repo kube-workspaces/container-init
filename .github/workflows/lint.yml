@@ -18,6 +18,10 @@ jobs:
       - run: make fmt-check
       - name: Validate GitHub Actions workflows
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+        # setup-go pins GOTOOLCHAIN=local. This tool needs Go 1.25+, while
+        # the application and its compatibility tests intentionally use 1.24.
+        env:
+          GOTOOLCHAIN: auto
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.13.2
