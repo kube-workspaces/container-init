@@ -160,10 +160,11 @@ docker build -t container-init:local .
 ```
 
 The Build workflow publishes `ghcr.io/kube-workspaces/container-init:sha-<full-commit>`
-on main pushes; exact release tag pushes also publish `:<version>`. PR/manual
-builds validate the image without pushing. Publishing is gated on native
-builds/tests and lint and consumes the verified per-target binary artifacts.
-The tag release waits for image publication as well as archive packaging.
+and `ghcr.io/kube-workspaces/container-init:latest` on main pushes; exact release
+tag pushes also publish `:<version>`. PR/manual builds validate the image without
+pushing. Publishing is gated on native builds/tests and lint and consumes the
+verified per-target binary artifacts. The tag release waits for image publication
+as well as archive packaging.
 
 Configure a published immutable reference through Helm's
 `controller.containerInitImage` or the controller's `KW_CONTAINER_INIT_IMAGE` /
