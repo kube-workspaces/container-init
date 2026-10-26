@@ -1,0 +1,7 @@
+**
+!Dockerfile
+!bin/
+!bin/linux-amd64/
+!bin/linux-arm64/
+!bin/linux-amd64/container-init
+!bin/linux-arm64/container-init

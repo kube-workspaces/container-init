@@ -5,8 +5,9 @@ cloud-init `#cloud-config`, before launching their application. Intended for
 both kube-workspaces `container` and `scratch` workspaces, and usable standalone.
 
 **Status:** initial executable foundation. Six of the selected twelve top-level
-keys are implemented; platform integration, account/SSH/CA/timezone adapters,
-privilege dropping and persistent execution state are pending. Compatibility is
+keys are implemented. Opt-in platform integration requires matching Image/
+Workspace CRDs, API and controller. Account/SSH/CA/timezone adapters, privilege
+dropping and persistent execution state are pending. Compatibility is
 with the documented subset, not every cloud-init module or nested option.
 
 ## Build and run
@@ -139,11 +140,37 @@ separate writable root. Static Go linking does not provide missing shells,
 package managers or account tools.
 
 Kubernetes does not automatically prepend an executable to an OCI entrypoint.
-Injected usage currently requires explicit application argv. No registry
-entrypoint discovery, installer image publishing, CRD/API wiring or user-data
-Secret creation is implemented here yet. The platform currently consumes
-`Image.spec.defaultUserData` only for VM cloud-init; adding that field to a
-non-VM Image alone does not invoke this executable.
+Injected usage requires explicit application argv; no registry entrypoint
+discovery is performed. In kube-workspaces, `Image.spec.defaultContainerInit`
+opts in, `defaultCommand`/`defaultArgs` supply startup, and `defaultUserData`
+provides the default document. The API snapshots these settings; the controller
+owns Secret delivery and PodSpec injection. Omitted/disabled initialization
+preserves ordinary startup. Baked-in mode only delivers the data file.
+See the [platform integration guide](https://github.com/kube-workspaces/deploy/blob/main/docs/container-init.md).
+
+### Installer OCI image
+
+The Dockerfile packages the already-built static executable with Alpine's copy
+utility. It uses no cross-architecture RUN steps, so multi-architecture packaging
+does not require QEMU. Locally:
+
+```sh
+make build-all VERSION=local
+docker build -t container-init:local .
+```
+
+The Build workflow publishes `ghcr.io/kube-workspaces/container-init:sha-<full-commit>`
+on main pushes; exact release tag pushes also publish `:<version>`. PR/manual
+builds validate the image without pushing. Publishing is gated on native
+builds/tests and lint and consumes the verified per-target binary artifacts.
+The tag release waits for image publication as well as archive packaging.
+
+Configure a published immutable reference through Helm's
+`controller.containerInitImage` or the controller's `KW_CONTAINER_INIT_IMAGE` /
+`--container-init-image` setting. Empty disables injected mode. The controller
+uses the image's `/usr/local/bin/container-init` and `/bin/sh` to copy the runner
+into its shared writable installer mount; the main container mounts it read-only.
+Image pull access/visibility must be configured like other workspace images.
 
 ## Development
 
