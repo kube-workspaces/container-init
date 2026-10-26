@@ -1,0 +1,9 @@
+#cloud-config
+# Run inside a disposable Debian/Ubuntu or Alpine container as root.
+# Installation refreshes the package cache automatically.
+package_update: true
+packages:
+  - curl
+  - ca-certificates
+runcmd:
+  - [curl, --version]

@@ -1,0 +1,164 @@
+name: Build
+
+# Main/PR/manual builds expose downloadable artifacts. Only an intentional push
+# of an exact vMAJOR.MINOR.PATCH tag publishes a GitHub Release. The same resolved
+# version is used in both binaries, archive names, VERSION files and notes.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  lint:
+    uses: ./.github/workflows/lint.yml
+
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Resolve exact tag or development version
+        id: version
+        env:
+          BUILD_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/release.py version --ref "$BUILD_REF")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [version]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build static binary
+        run: make build VERSION="$VERSION"
+      - name: Verify native binary version
+        run: |
+          set -euo pipefail
+          test "$(bin/container-init --version)" = "$VERSION"
+          bin/container-init --user-data examples/basic.yaml --validate
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: bin/container-init
+          if-no-files-found: error
+
+  assemble:
+    name: Package and verify archives
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: binary-linux-amd64
+          path: bin/linux-amd64
+      - uses: actions/download-artifact@v8
+        with:
+          name: binary-linux-arm64
+          path: bin/linux-arm64
+      - name: Package and verify the release contract
+        run: make package verify-release VERSION="$VERSION"
+      - name: Verify the packaged native binary
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/container-init-$VERSION-linux-amd64.tar.gz" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/container-init-linux-amd64/container-init" --version)" = "$VERSION"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: container-init-linux-amd64
+          path: dist/*-linux-amd64.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: container-init-linux-arm64
+          path: dist/*-linux-arm64.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [version, assemble, lint, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: container-init-linux-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: SHA256SUMS
+          path: dist
+      - name: Reverify the downloaded release assets
+        run: make verify-release VERSION="$VERSION"
+      - name: Compose download instructions and categorized direct-commit notes
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: python3 scripts/release.py notes --version "$VERSION" --repo "$REPOSITORY" > "$RUNNER_TEMP/release-notes.md"
+      - name: Publish or update release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release edit "$VERSION" --title "$VERSION" --notes-file "$RUNNER_TEMP/release-notes.md"
+          else
+            gh release create "$VERSION" --verify-tag --title "$VERSION" --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+          gh release upload "$VERSION" \
+            "dist/container-init-$VERSION-linux-amd64.tar.gz" \
+            "dist/container-init-$VERSION-linux-arm64.tar.gz" \
+            dist/SHA256SUMS --clobber

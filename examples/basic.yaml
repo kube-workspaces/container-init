@@ -1,0 +1,8 @@
+#cloud-config
+write_files:
+  - path: /run/container-init-example/message
+    content: |
+      The application can read this file after initialization.
+    permissions: '0644'
+runcmd:
+  - [cat, /run/container-init-example/message]

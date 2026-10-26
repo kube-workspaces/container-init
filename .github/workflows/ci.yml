@@ -1,0 +1,42 @@
+name: CI
+
+# Called by Build for pushes, PRs, manual builds and tags. This makes the same
+# checks a release prerequisite without running a second duplicate pipeline.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Formatting, vet, race tests and release-tool tests
+        run: make check
+      - name: Verify version injection and example configuration
+        run: |
+          set -euo pipefail
+          make build VERSION=ci-smoke
+          test "$(bin/container-init --version)" = ci-smoke
+          bin/container-init --user-data examples/basic.yaml --validate
+          bin/container-init --user-data examples/packages.yaml --validate
+      - name: Disposable Debian and Alpine integration tests
+        if: matrix.target == 'linux-amd64'
+        run: make test-integration
